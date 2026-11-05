@@ -268,6 +268,79 @@ export function parseGloriousClassicBatteryResponse(body: Uint8Array): GloriousC
 }
 
 // ---------------------------------------------------------------------------
+// Firmware version & Compx nRF52840 USB HID Bootloader (258a:2103 / 258a:2113)
+// Verified against hardware on Glorious Forge Series One Pro (258a:2018 / 258a:2031)
+// and FirmwareUpdate.exe (C52840Dongle).
+// ---------------------------------------------------------------------------
+
+export const GLORIOUS_CLASSIC_MOUSE_BOOTLOADER_PID = 0x2103;
+export const GLORIOUS_CLASSIC_RECEIVER_BOOTLOADER_PID = 0x2113;
+export const GLORIOUS_CLASSIC_BOOTLOADER_XOR_KEY = 0x55;
+
+export interface GloriousClassicFirmware {
+  version: string;
+  major: number;
+  minor: number;
+  patch: number;
+  build: number;
+  productId: number | null;
+}
+
+/**
+ * Firmware version request:
+ *   bfr[3]=target (0x00 for wired mouse or receiver own FW, 0x02 for wireless mouse),
+ *   bfr[4]=0x06 (length), bfr[5]=0x00 (system bank), bfr[6]=0x81 (firmware command).
+ */
+export function buildGloriousClassicFirmwareRequestPayload(
+  target: "device" | "wirelessMouse" = "device",
+): Uint8Array<ArrayBuffer> {
+  const body = packet();
+  bfr(body, 3, target === "wirelessMouse" ? 0x02 : 0x00);
+  bfr(body, 4, 0x06);
+  bfr(body, 5, 0x00);
+  bfr(body, 6, 0x81);
+  return body;
+}
+
+/**
+ * Parses the 64-byte feature-report reply to `buildGloriousClassicFirmwareRequestPayload()`.
+ * Reply layout (body[n] = bfr[n + 1]):
+ *   body[0] = 0xa1 (status OK), body[4] = 0x00, body[5] = 0x81 (echo),
+ *   body[6..9] = major, minor, patch, build,
+ *   body[10..11] = big-endian uint16 USB productId (e.g. 0x2018).
+ */
+export function parseGloriousClassicFirmwareResponse(body: Uint8Array): GloriousClassicFirmware | null {
+  if (body.length < 12 || body[0] !== 0xa1 || body[5] !== 0x81) return null;
+  const major = body[6]!;
+  const minor = body[7]!;
+  const patch = body[8]!;
+  const build = body[9]!;
+  const productId = ((body[10]! << 8) | body[11]!) || null;
+  return {
+    version: `${major}.${minor}.${patch}.${build}`,
+    major,
+    minor,
+    patch,
+    build,
+    productId,
+  };
+}
+
+/**
+ * Builds the 64-byte feature-report body (`C52840Dongle::SetBLDeviceMode`) that
+ * reboots a Glorious nRF52840 mouse (`258a:2018`) or receiver (`258a:2031`) into
+ * its resident Compx USB HID bootloader (`258a:2103` / `258a:2113`).
+ */
+export function buildGloriousClassicEnterBootloaderPayload(): Uint8Array<ArrayBuffer> {
+  const body = packet();
+  bfr(body, 4, 0x02);
+  bfr(body, 5, 0x00);
+  bfr(body, 6, 0x00);
+  bfr(body, 7, 0xb0);
+  return body;
+}
+
+// ---------------------------------------------------------------------------
 // DPI, polling rate, lift-off distance (korkje/mxw). None of these three has
 // a read command in mxw either — every write below is fire-and-forget, same
 // as the RGB/debounce commands above.

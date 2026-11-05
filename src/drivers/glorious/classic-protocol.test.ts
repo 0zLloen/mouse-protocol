@@ -7,6 +7,8 @@ import {
   buildGloriousClassicBatteryRequestPayload,
   buildGloriousClassicDebouncePayload,
   buildGloriousClassicDpiStagesPayload,
+  buildGloriousClassicEnterBootloaderPayload,
+  buildGloriousClassicFirmwareRequestPayload,
   buildGloriousClassicLiftOffPayload,
   buildGloriousClassicPollingRatePayload,
   buildGloriousClassicRgbPayload,
@@ -14,6 +16,7 @@ import {
   gloriousClassicEncodePollingRate,
   gloriousClassicRateByte,
   parseGloriousClassicBatteryResponse,
+  parseGloriousClassicFirmwareResponse,
 } from "../../glorious-classic/index.ts";
 
 // Every assertion below is written against the source's own `bfr[n]` buffer
@@ -178,4 +181,39 @@ test("lift-off distance payload encodes millimetres-1", () => {
 
   const twoMm = buildGloriousClassicLiftOffPayload(2);
   assert.equal(twoMm[6], 0x01); // bfr[7] = 2mm - 1
+});
+
+test("firmware request and response match Series One Pro hardware reply", () => {
+  const req = buildGloriousClassicFirmwareRequestPayload("device");
+  assert.equal(req[2], 0x00); // bfr[3] target
+  assert.equal(req[3], 0x06); // bfr[4] length
+  assert.equal(req[4], 0x00); // bfr[5] system bank
+  assert.equal(req[5], 0x81); // bfr[6] firmware command
+
+  const reply = new Uint8Array(64);
+  reply[0] = 0xa1;
+  reply[4] = 0x00;
+  reply[5] = 0x81;
+  reply[6] = 1;
+  reply[7] = 0;
+  reply[8] = 0;
+  reply[9] = 0;
+  reply[10] = 0x20;
+  reply[11] = 0x18;
+  assert.deepEqual(parseGloriousClassicFirmwareResponse(reply), {
+    version: "1.0.0.0",
+    major: 1,
+    minor: 0,
+    patch: 0,
+    build: 0,
+    productId: 0x2018,
+  });
+});
+
+test("bootloader entry payload matches C52840Dongle::SetBLDeviceMode", () => {
+  const bl = buildGloriousClassicEnterBootloaderPayload();
+  assert.equal(bl[3], 0x02); // bfr[4]
+  assert.equal(bl[4], 0x00); // bfr[5]
+  assert.equal(bl[5], 0x00); // bfr[6]
+  assert.equal(bl[6], 0xb0); // bfr[7]
 });
