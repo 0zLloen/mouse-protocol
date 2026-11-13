@@ -116,4 +116,6 @@ battery reads have been exercised on hardware (wired); the classic RGB, DPI,
 polling, lift-off and debounce writes have not. See
 [docs/glorious-series-one-pro.md](docs/glorious-series-one-pro.md) for those
 replies and the resident Compx bootloader protocol (entry, read-back,
-erase/program behavior).
+erase/program behavior). On firmware with the Open Directional DPI patch the
+same driver reads and writes the per-direction sensitivity profile; its
+section there lists what was verified.

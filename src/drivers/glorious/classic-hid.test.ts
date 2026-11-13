@@ -3,6 +3,14 @@ import test from "node:test";
 
 import { GloriousClassicHidClient } from "./classic-hid.ts";
 import { VENDOR_ID } from "../vendors.ts";
+import {
+  DDPI_FLAG_ENABLED,
+  DDPI_OPCODE,
+  ddpiCrc16,
+  decodeDdpiProfile,
+  encodeDdpiProfile,
+  type DdpiProfile,
+} from "../../open-directional-dpi/index.ts";
 
 function fakeCollection(usagePage: number, usage = 1) {
   return {
@@ -16,8 +24,13 @@ function fakeCollection(usagePage: number, usage = 1) {
   };
 }
 
-function fakeDevice(vendorId: number, productId: number, productName = "") {
+/**
+ * `reply` returns what successive GET_REPORTs read after a SET_REPORT; the last
+ * entry repeats. Without it every read returns 64 zero bytes.
+ */
+function fakeDevice(vendorId: number, productId: number, productName = "", reply?: (payload: Uint8Array) => Uint8Array[]) {
   const sent: Array<{ reportId: number; payload: Uint8Array }> = [];
+  let replies: Uint8Array[] = [new Uint8Array(64)];
   const device = {
     vendorId,
     productId,
@@ -31,8 +44,9 @@ function fakeDevice(vendorId: number, productId: number, productName = "") {
         ? new Uint8Array(source.buffer, source.byteOffset, source.byteLength)
         : new Uint8Array(source);
       sent.push({ reportId, payload: new Uint8Array(view) });
+      if (reply) replies = reply(new Uint8Array(view));
     },
-    receiveFeatureReport: async () => new DataView(new Uint8Array(64).buffer),
+    receiveFeatureReport: async () => new DataView((replies.length > 1 ? replies.shift()! : replies[0]!).slice().buffer),
     addEventListener: () => {},
     removeEventListener: () => {},
   };
@@ -168,4 +182,156 @@ test("Model D 2 PRO 4K/8KHz Edition left the classic table for the core2 driver"
   // support); the classic driver must no longer claim either PID.
   assert.equal(GloriousClassicHidClient.isSupported(fakeDevice(VENDOR_ID.gloriousClassic, 0x201c).device), false);
   assert.equal(GloriousClassicHidClient.isSupported(fakeDevice(VENDOR_ID.gloriousClassic, 0x2036).device), false);
+});
+
+// ---------------------------------------------------------------------------
+// Open Directional DPI on a Series One Pro (ported from open-directional-dpi's
+// integrations/openmouse tests 01-03, 17 and 20).
+// ---------------------------------------------------------------------------
+
+const STOCK_VERSION_REPLY = [0xa1, 0x00, 0x00, 0x03, 0x00, 0x81, 0x01, 0x00, 0x00, 0x00, 0x20, 0x18];
+const DP01 = [0x44, 0x50, 0x30, 0x31];
+// GET_CAPABILITIES payload in the layout of patch build 21ea252: flags 0xfa, 800 DPI.
+const CAPABILITIES = Uint8Array.from(Buffer.from("44503031010100fa3200ffff1000000410802003c0d40100", "hex"));
+const NEUTRAL: DdpiProfile = { flags: 0, baseDpi: 800, globalGainQ8_8: 256, multipliersQ8_8: [256, 256, 256, 256, 256, 256, 256, 256], reserved: 0 };
+const UP_HALF: DdpiProfile = { ...NEUTRAL, flags: DDPI_FLAG_ENABLED, multipliersQ8_8: [256, 256, 256, 256, 256, 256, 128, 256] };
+
+const isDdpi = (packet: Uint8Array) => packet[0] === 0x44 && packet[1] === 0x50;
+const status = (byte: number) => Uint8Array.of(byte, ...new Uint8Array(63));
+
+/**
+ * A Series One Pro by cable or through its receiver. A patched mouse stamps the
+ * version reply and answers requests like patch build 21ea252. `lag` turns the
+ * answer and the previous answer into what successive GET_REPORTs return.
+ */
+function seriesOnePro({ patched, receiver = false }: { patched: boolean; receiver?: boolean }) {
+  const mouse = {
+    profile: encodeDdpiProfile(NEUTRAL),
+    previous: new Uint8Array(64),
+    lag: (answer: Uint8Array, _previous: Uint8Array): Uint8Array[] => [answer],
+  };
+  const answerTo = (request: Uint8Array): Uint8Array => {
+    const reply = new Uint8Array(64);
+    if (isDdpi(request)) {
+      assert.ok(patched, "a stock mouse got an Open Directional DPI packet");
+      const packet = request.slice();
+      if (receiver) {
+        assert.deepEqual([packet[2], packet[3]], [0x02, 0x3a], "relay envelope");
+        packet[2] = 0x01;
+        packet[3] = 0x00;
+      }
+      assert.equal(packet[62]! | (packet[63]! << 8), ddpiCrc16(packet.subarray(0, 62)), "CRC over the canonical packet");
+      if (packet[6] === DDPI_OPCODE.setProfile) mouse.profile = encodeDdpiProfile(decodeDdpiProfile(packet.subarray(8)));
+      reply.set(packet.subarray(0, 8));
+      reply[3] = 0xa1;
+      reply.set(packet[6] === DDPI_OPCODE.getCapabilities ? CAPABILITIES : mouse.profile, 8);
+      const crc = ddpiCrc16(reply.subarray(0, 62));
+      reply[62] = crc & 0xff;
+      reply[63] = crc >> 8;
+      return reply;
+    }
+    if (receiver) assert.equal(request[2], 0x02, "a request ran a receiver-local handler");
+    if (request[4] === 0x00 && request[5] === 0x81) {
+      reply.set(STOCK_VERSION_REPLY);
+      reply[2] = request[2]!;
+      if (patched) {
+        reply.set(DP01, 12);
+        reply.set(DP01, 16);
+      }
+      // The receiver copies back as many bytes as the request asked for.
+      if (receiver) reply.fill(0, request[3]! + 6);
+    }
+    return reply;
+  };
+  const { device, sent } = fakeDevice(VENDOR_ID.gloriousClassic, receiver ? 0x2031 : 0x2018, "Series One PRO Wireless", (request) => {
+    const answer = answerTo(request);
+    const replies = mouse.lag(answer, mouse.previous);
+    mouse.previous = answer;
+    return replies;
+  });
+  (device.collections[0] as { usagePage: number }).usagePage = 0xffff;
+  return { client: new GloriousClassicHidClient(device), sent, mouse };
+}
+
+test("a stock Series One Pro gets the version query once and never an Open Directional DPI packet", async () => {
+  for (const receiver of [false, true]) {
+    const { client, sent } = seriesOnePro({ patched: false, receiver });
+    assert.equal((await client.readStatus()).directionalDpi, undefined);
+    await assert.rejects(() => client.setDirectionalDpiProfile(UP_HALF), /does not have the Open Directional DPI patch/);
+    await assert.rejects(() => client.saveDirectionalDpi(), /does not have/);
+    assert.equal((await client.readStatus()).directionalDpi, undefined);
+    assert.equal(sent.filter(({ payload }) => isDdpi(payload)).length, 0);
+    assert.equal(sent.filter(({ payload }) => payload[5] === 0x81).length, 1, "detection is cached");
+  }
+});
+
+test("other classic mice get no directional DPI request at all", async () => {
+  const { device, sent } = fakeDevice(VENDOR_ID.gloriousClassic, 0x2011);
+  const client = new GloriousClassicHidClient(device);
+  assert.equal((await client.readStatus()).directionalDpi, undefined);
+  await assert.rejects(() => client.setDirectionalDpiProfile(UP_HALF), /needs a Series One Pro/);
+  assert.equal(sent.filter(({ payload }) => payload[5] === 0x81 || isDdpi(payload)).length, 0);
+});
+
+test("a patched Series One Pro by cable reads, sets and saves its profile", async () => {
+  const { client, sent } = seriesOnePro({ patched: true });
+  assert.deepEqual((await client.readStatus()).directionalDpi, { profile: NEUTRAL, sensorDpi: 800, canSave: true });
+  assert.deepEqual(await client.setDirectionalDpiProfile(UP_HALF), UP_HALF);
+  assert.deepEqual(await client.saveDirectionalDpi(), UP_HALF);
+  const requests = sent.filter(({ payload }) => isDdpi(payload)).map(({ payload }) => [payload[4], payload[6]]);
+  assert.deepEqual(requests, [[5, 0x01], [6, 0x02], [7, 0x03], [8, 0x04]]);
+  await assert.rejects(() => client.setDirectionalDpiProfile({ ...UP_HALF, baseDpi: 10 }), /Base DPI/);
+  assert.equal(sent.filter(({ payload }) => isDdpi(payload)).length, 4, "an invalid profile is not sent");
+});
+
+test("through the receiver: envelope, stale answers and a transient 0xa4 before the answer", async () => {
+  const { client, sent, mouse } = seriesOnePro({ patched: true, receiver: true });
+  // The previous answer, then pending, then the link briefly down (a flash erase).
+  mouse.lag = (answer, previous) => [previous, status(0xa0), status(0xa4), status(0xa4), answer];
+  assert.deepEqual((await client.readStatus()).directionalDpi, { profile: NEUTRAL, sensorDpi: 800, canSave: true });
+  assert.deepEqual(await client.setDirectionalDpiProfile(UP_HALF), UP_HALF);
+  // Same opcode again: the previous answer differs only in seq and must be skipped.
+  assert.deepEqual(await client.setDirectionalDpiProfile(NEUTRAL), NEUTRAL);
+  assert.deepEqual(await client.saveDirectionalDpi(), NEUTRAL);
+  assert.equal(sent.filter(({ payload }) => isDdpi(payload)).length, 5);
+});
+
+test("through the receiver: a final 0xa4 is an error and detection is asked again later", async () => {
+  const { client, sent, mouse } = seriesOnePro({ patched: true, receiver: true });
+  mouse.lag = () => [status(0xa4)];
+  assert.equal((await client.readStatus()).directionalDpi, undefined);
+  await assert.rejects(() => client.setDirectionalDpiProfile(UP_HALF), /receiver cannot reach the mouse/);
+  assert.equal(sent.filter(({ payload }) => isDdpi(payload)).length, 0, "no request before the stamp was seen");
+  mouse.lag = (answer) => [answer];
+  assert.equal((await client.readStatus()).directionalDpi?.canSave, true);
+});
+
+test("through the receiver: no directional DPI read while the battery read says the mouse is asleep", async () => {
+  // The receiver answers 0xa4 at once when the link is down, over the request it holds.
+  const { device, sent } = fakeDevice(VENDOR_ID.gloriousClassic, 0x2031, "", (request) => [Uint8Array.of(0xa4, ...request.subarray(1))]);
+  (device.collections[0] as { usagePage: number }).usagePage = 0xffff;
+  const client = new GloriousClassicHidClient(device);
+  assert.equal((await client.readStatus()).directionalDpi, undefined);
+  assert.equal(sent.filter(({ payload }) => payload[5] === 0x81 || isDdpi(payload)).length, 0);
+  assert.equal(sent.length, 1, "only the battery request");
+});
+
+test("a 65-byte reply with a leading report id is accepted", async () => {
+  const { client, mouse } = seriesOnePro({ patched: true });
+  mouse.lag = (answer) => [Uint8Array.of(0, ...answer)];
+  assert.deepEqual(await client.setDirectionalDpiProfile(UP_HALF), UP_HALF);
+});
+
+test("a battery read cannot land between a request and its answer", async () => {
+  const { client, sent, mouse } = seriesOnePro({ patched: true, receiver: true });
+  await client.readStatus();
+  mouse.lag = (answer) => [status(0xa0), status(0xa0), status(0xa0), status(0xa0), answer];
+  const setting = client.setDirectionalDpiProfile(UP_HALF);
+  // Start the status read (and its battery request) while SET_PROFILE waits for its answer.
+  while (!sent.some(({ payload }) => isDdpi(payload) && payload[6] === DDPI_OPCODE.setProfile)) {
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  }
+  const reading = client.readStatus();
+  assert.deepEqual(await setting, UP_HALF);
+  assert.deepEqual((await reading).directionalDpi?.profile, UP_HALF);
 });

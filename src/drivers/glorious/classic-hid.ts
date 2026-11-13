@@ -15,16 +15,32 @@ import {
   buildGloriousClassicBatteryRequestPayload,
   buildGloriousClassicDebouncePayload,
   buildGloriousClassicDpiStagesPayload,
+  buildGloriousClassicFirmwareRequestPayload,
   buildGloriousClassicLiftOffPayload,
   buildGloriousClassicPollingRatePayload,
   buildGloriousClassicRgbPayload,
   gloriousClassicDecodePollingRate,
   gloriousClassicEncodePollingRate,
+  gloriousClassicHasDdpiStamp,
+  gloriousClassicRelayEnvelope,
   parseGloriousClassicBatteryResponse,
+  parseGloriousClassicFirmwareResponse,
   type GloriousClassicBattery,
   type GloriousClassicBatteryState,
   type GloriousClassicRgb,
 } from "../../glorious-classic/index.ts";
+import {
+  DDPI_CAPABILITY_SAVE,
+  DDPI_OPCODE,
+  DDPI_SEQ_MAX,
+  DDPI_SEQ_MIN,
+  buildDdpiRequest,
+  decodeDdpiProfile,
+  encodeDdpiProfile,
+  parseDdpiCapabilities,
+  parseDdpiResponse,
+  type DdpiProfile,
+} from "../../open-directional-dpi/index.ts";
 import { GLORIOUS_CLASSIC_PRODUCTS, VENDOR_ID } from "../vendors.ts";
 
 /**
@@ -51,6 +67,10 @@ import { GLORIOUS_CLASSIC_PRODUCTS, VENDOR_ID } from "../vendors.ts";
  * ./hid.ts, this class keeps its own last-applied-settings cache so the UI
  * has something to show. Only battery status is actually read from the
  * mouse.
+ *
+ * A Series One Pro (258a:2018 / 258a:2031) running the Open Directional DPI
+ * patch also reads and writes its per-direction profile (the Open Directional
+ * DPI section of the class).
  */
 
 // Config channel usage pages. Older firmware used 0xff01/0xff00; newer
@@ -58,6 +78,15 @@ import { GLORIOUS_CLASSIC_PRODUCTS, VENDOR_ID } from "../vendors.ts";
 // unnumbered config feature report to the 0xffff:0 collection instead.
 const CLASSIC_USAGE_PAGES = [0xff01, 0xff00, 0xffff];
 const BATTERY_RESPONSE_DELAY_MS = 60;
+
+// Series One Pro running the Open Directional DPI patch: cable and 2.4 GHz receiver.
+const SERIES_ONE_PRO_PID = 0x2018;
+const SERIES_ONE_PRO_RECEIVER_PID = 0x2031;
+// The patch answers from its main loop, through the receiver after a radio round
+// trip, and the receiver can show 0xa4 for a few hundred ms while the mouse
+// erases flash. Poll for 2 s; a count rather than a clock keeps fake timers fast.
+const DDPI_POLLS = 200;
+const DDPI_POLL_MS = 10;
 
 const BATTERY_STATE_LABEL: Record<GloriousClassicBatteryState, MouseStatus["batteryState"]> = {
   Normal: "Discharging",
@@ -100,6 +129,10 @@ export class GloriousClassicHidClient {
   private readonly reportId: number;
   private readonly reportLength: number;
   private lastRgb: GloriousClassicRgb = GLORIOUS_CLASSIC_DEFAULT_RGB;
+  private queue: Promise<unknown> = Promise.resolve();
+  private ddpiSeq = DDPI_SEQ_MIN;
+  /** Whether the firmware carries the Open Directional DPI stamp; undefined until it has answered. */
+  private ddpiPatched: boolean | undefined;
 
   constructor(device: HIDDevice) {
     this.device = device;
@@ -147,8 +180,19 @@ export class GloriousClassicHidClient {
     return resized;
   }
 
-  private async send(payload: Uint8Array<ArrayBuffer>): Promise<void> {
+  /** One feature-report transaction at a time, so a write or battery read cannot land between a request and its answer. */
+  private run<T>(task: () => Promise<T>): Promise<T> {
+    const next = this.queue.then(task, task);
+    this.queue = next.catch(() => undefined);
+    return next;
+  }
+
+  private async write(payload: Uint8Array<ArrayBuffer>): Promise<void> {
     await this.device.sendFeatureReport(this.reportId, this.fitPayload(payload));
+  }
+
+  private send(payload: Uint8Array<ArrayBuffer>): Promise<void> {
+    return this.run(() => this.write(payload));
   }
 
   async open(): Promise<void> {
@@ -216,6 +260,11 @@ export class GloriousClassicHidClient {
     await this.open();
     const state = this.loadState();
     const battery = this.isWireless() ? await this.readBattery().catch(() => null) : null;
+    // A receiver that just answered the battery read with 0xa4 cannot reach the mouse;
+    // skip the 2 s directional DPI poll. battery is null on the cable.
+    const directionalDpi = this.isDirectionalDpiCandidate() && battery?.state !== "Asleep"
+      ? await this.readDirectionalDpi().catch(() => null)
+      : null;
     const wireless = this.isWireless();
     const core2 = this.isCore2();
     const restricted = core2 || !this.isConfirmedReportLength();
@@ -239,6 +288,7 @@ export class GloriousClassicHidClient {
       debounceMs: state.debounceMs,
       liftOffDistance,
       firmware: [],
+      ...(directionalDpi ? { directionalDpi } : {}),
     };
   }
 
@@ -315,12 +365,109 @@ export class GloriousClassicHidClient {
     return rgb;
   }
 
-  private async readBattery(): Promise<GloriousClassicBattery> {
-    await this.send(buildGloriousClassicBatteryRequestPayload());
-    await this.delay(BATTERY_RESPONSE_DELAY_MS);
-    const view = await this.device.receiveFeatureReport(this.reportId);
-    const body = new Uint8Array(view.buffer, view.byteOffset, Math.min(view.byteLength, GLORIOUS_CLASSIC_PACKET_LENGTH));
-    return parseGloriousClassicBatteryResponse(body);
+  private readBattery(): Promise<GloriousClassicBattery> {
+    return this.run(async () => {
+      await this.write(buildGloriousClassicBatteryRequestPayload());
+      await this.delay(BATTERY_RESPONSE_DELAY_MS);
+      const view = await this.device.receiveFeatureReport(this.reportId);
+      const body = new Uint8Array(view.buffer, view.byteOffset, Math.min(view.byteLength, GLORIOUS_CLASSIC_PACKET_LENGTH));
+      return parseGloriousClassicBatteryResponse(body);
+    });
+  }
+
+  // -------------------------------------------------------------------------
+  // Open Directional DPI on a patched Series One Pro (see
+  // ../../open-directional-dpi/index.ts and docs/glorious-series-one-pro.md).
+  // Nothing but the stock version query reaches a mouse without the patch stamp.
+  // -------------------------------------------------------------------------
+
+  private isDirectionalDpiCandidate(): boolean {
+    return this.device.vendorId === VENDOR_ID.gloriousClassic
+      && (this.device.productId === SERIES_ONE_PRO_PID || this.device.productId === SERIES_ONE_PRO_RECEIVER_PID)
+      && this.isConfirmedReportLength();
+  }
+
+  private isSeriesOneProReceiver(): boolean {
+    return this.device.productId === SERIES_ONE_PRO_RECEIVER_PID;
+  }
+
+  /**
+   * Sends `request` and reads the report until `answer` accepts one. Earlier reads
+   * can return the previous answer or a receiver status (0xa0 pending, 0xa4 link
+   * down, which can be transient). Call inside run().
+   */
+  private async exchange<T>(request: Uint8Array<ArrayBuffer>, answer: (body: Uint8Array) => T | null): Promise<T> {
+    await this.write(request);
+    let body: Uint8Array = new Uint8Array(0);
+    for (let poll = 0; poll < DDPI_POLLS; poll += 1) {
+      if (poll > 0) await this.delay(DDPI_POLL_MS);
+      const view = await this.device.receiveFeatureReport(this.reportId);
+      body = new Uint8Array(view.buffer, view.byteOffset, view.byteLength);
+      // A 65-byte reply starts with the report id.
+      if (body.length === GLORIOUS_CLASSIC_PACKET_LENGTH + 1 && body[0] === 0) body = body.subarray(1);
+      const result = answer(body);
+      if (result !== null) return result;
+    }
+    throw new Error(this.isSeriesOneProReceiver() && body[0] === 0xa4
+      ? "The receiver cannot reach the mouse (switched off, asleep or out of range). Move the mouse and try again."
+      : "The mouse did not answer within 2 s.");
+  }
+
+  /**
+   * Asks the stock version query once per client and checks for the patch stamp.
+   * Only a definite answer is cached: no answer, or a final 0xa4 from the
+   * receiver, throws and the next call asks again. Call inside run().
+   */
+  private async hasDirectionalDpiPatch(): Promise<boolean> {
+    if (this.ddpiPatched === undefined) {
+      const relay = this.isSeriesOneProReceiver();
+      const reply = await this.exchange(
+        buildGloriousClassicFirmwareRequestPayload({ relay }),
+        (body) => (parseGloriousClassicFirmwareResponse(body) ? body.slice() : null),
+      );
+      this.ddpiPatched = gloriousClassicHasDdpiStamp(reply, relay);
+    }
+    return this.ddpiPatched;
+  }
+
+  /** Sends one Open Directional DPI request and returns the payload of its answer. */
+  private async directionalDpiRequest(opcode: number, payload?: Uint8Array): Promise<Uint8Array> {
+    if (!this.isDirectionalDpiCandidate()) throw new Error("Directional DPI needs a Series One Pro with patched firmware.");
+    await this.open();
+    return this.run(async () => {
+      if (!(await this.hasDirectionalDpiPatch())) throw new Error("This mouse's firmware does not have the Open Directional DPI patch.");
+      const seq = this.ddpiSeq;
+      this.ddpiSeq = seq === DDPI_SEQ_MAX ? DDPI_SEQ_MIN : seq + 1;
+      const request = buildDdpiRequest(opcode, seq, 0, payload);
+      return this.exchange(
+        this.isSeriesOneProReceiver() ? gloriousClassicRelayEnvelope(request) : request,
+        (body) => parseDdpiResponse(body, seq, opcode),
+      );
+    });
+  }
+
+  private async readDirectionalDpi(): Promise<NonNullable<MouseStatus["directionalDpi"]>> {
+    const capabilities = parseDdpiCapabilities(await this.directionalDpiRequest(DDPI_OPCODE.getCapabilities));
+    const profile = decodeDdpiProfile(await this.directionalDpiRequest(DDPI_OPCODE.getProfile));
+    return { profile, sensorDpi: capabilities.sensorDpi, canSave: (capabilities.flags & DDPI_CAPABILITY_SAVE) !== 0 };
+  }
+
+  /**
+   * Loads a profile into the mouse (SET_PROFILE) and returns the profile it
+   * echoes. DDPI_FLAG_ENABLED is the on/off switch. Lost at power-off until
+   * saveDirectionalDpi().
+   */
+  async setDirectionalDpiProfile(profile: DdpiProfile): Promise<DdpiProfile> {
+    const payload = encodeDdpiProfile(profile);
+    return decodeDdpiProfile(await this.directionalDpiRequest(DDPI_OPCODE.setProfile, payload));
+  }
+
+  /**
+   * Stores the active profile in the mouse's flash (SAVE_FLASH) and returns it.
+   * Call it only on an explicit user action: a changed profile erases a flash page.
+   */
+  async saveDirectionalDpi(): Promise<DdpiProfile> {
+    return decodeDdpiProfile(await this.directionalDpiRequest(DDPI_OPCODE.saveFlash));
   }
 
   private delay(milliseconds: number): Promise<void> {

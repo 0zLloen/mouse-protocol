@@ -88,3 +88,23 @@ Every command carries `body[2] = deviceID` (`0x00` for the wired mouse). All fiv
 Status byte `body[0]` (the updater's result codes): `0xA1`/`0x02` success, `0xA2` fail (also: address out of the readable range), `0xA3` unknown command, `0xA4` out of range.
 
 The flash order used here: `Erase`, then `Program` `0xFF` over the vector table at `0x6000` and read it back, program and verify the rest of the image, write the vector table last, then `Exit`. The `0xFF` write protects against a half-written vector table only once it has landed. An interruption during or right after `Erase` leaves the old vector table with `0x6000`–`0x1DFFF` intact and the range `Erase` clears (from `0x1E000`) erased, or only partly erased if `Erase` itself was cut short: still a complete image for the stock application (it ends at `0x1CC8F`), a broken one for any old image that reached `0x1E000`. Whether the bootloader boots it, or stays resident when `0x6000` is `0xFF`, is unknown: its code has never been read and an interrupted flash has not been tried.
+
+---
+
+## 4. Patched Firmware: Open Directional DPI
+
+[open-directional-dpi](https://github.com/0zLloen/open-directional-dpi) (MIT) patches the stock v1.0.0.0 application to add per-direction sensitivity: one gain per 45° direction, 0.0625x to 4x. The patch keeps every stock command and adds its own 64-byte packets to the same Feature report. Packets and profile: `@openmouse/protocol/open-directional-dpi`; reference: that project's [`spec/hid-protocol-v1.md`](https://github.com/0zLloen/open-directional-dpi/blob/1acd0fd/spec/hid-protocol-v1.md) at commit `1acd0fd`. `GloriousClassicHidClient` reads the profile into `MouseStatus.directionalDpi` and writes it with `setDirectionalDpiProfile()` and `saveDirectionalDpi()`.
+
+Verified on one retail mouse with three patch builds, Linux hidraw, 2026-11-13:
+
+- First build (before `505404c`), by cable: the stamp, GET_CAPABILITIES and GET_PROFILE. SET_PROFILE with "up" at 0.50x moved the up/down count ratio from 0.913 to 0.618. A SAVE_FLASH survived a reboot and two full reflashes.
+- [`505404c`](https://github.com/0zLloen/open-directional-dpi/commit/505404c), the first build with the receiver relay, through the receiver: the stamp, GET_CAPABILITIES, GET_PROFILE, SET_PROFILE and SAVE_FLASH. With "up" at 0.50x the ratio went from 0.938 to 0.570.
+- [`21ea252`](https://github.com/0zLloen/open-directional-dpi/commit/21ea252): by cable, GET_CAPABILITIES with the patch's idle-reset clock (bytes `20..23`) at 1000.0 ticks/s. Through the receiver, "up" at 0.50x gave 0.681 (0.938 flat on `505404c`), a changed save answered in 402 ms and an unchanged one in 24 ms, and the saved profile survived power-off.
+
+Not exercised: anything over WebHID on hardware.
+
+- **Stamp.** A host sends protocol packets only to a mouse that stamps `"DP01"` into the stock version reply (§2.1). By cable the stamp is at `body[16..19]`. Through the receiver the host sends the version query with `body[2] = 0x02`, `body[3] = 0x0a` (16 bytes copied back instead of 12) and the stamp is at `body[12..15]`. Stock v1.0.0.0 answers without it (checked by cable; through the receiver inferred, since the stock firmware has no stamp code), so it never receives a protocol packet.
+- **Sequence numbers.** Requests carry `seq` 5..255 in `body[4]`. Stock firmware rejects `body[4] >= 5` before any handler runs, and the receiver runs its local handlers (§2.4) only when `body[4] = 0x00`.
+- **Relay envelope.** Through the receiver every request goes with `body[2] = 0x02` and `body[3] = 0x3a` (all 64 bytes forwarded). Both bytes are set after the CRC, which covers the canonical packet (`body[2] = 0x01`, `body[3] = 0x00`); the patch restores them before checking it. Patch builds without the `body[12..15]` stamp do not cap their reply length and must not get the envelope.
+- **Answers.** The patch answers from its main loop, so GET_REPORT can return the previous answer first; only the answer with the request's `seq` and opcode counts. The host polls for 2 s. Through the receiver (`21ea252`) a save that erased flash answered after 402 ms and an unchanged save after 24 ms; during an erase the receiver can show `0xa4` for a few hundred ms, so only a `0xa4` still there at the end means the mouse is unreachable. While the mouse sends no reports the receiver also answered `0xa4`, so `readStatus()` skips the directional DPI read when the battery read in the same call came back `0xa4` (asleep).
+- **Saving.** SAVE_FLASH writes the profile to the flash page at `0x0007E000`, which the patch loads at boot. An unchanged profile is not written again. Save only on an explicit user action.

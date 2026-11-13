@@ -212,6 +212,17 @@ export interface MouseStatus {
   name: string;
   /** Optional LunaFury controls, populated only after successful device reads. */
   lunafury?: import("../lamzu/lunafury.js").LunaFurySettings;
+  /**
+   * Open Directional DPI (per-direction sensitivity) on firmware that has it,
+   * populated only after successful device reads. `canSave` means the mouse can
+   * store the profile in flash.
+   */
+  directionalDpi?: {
+    profile: import("../open-directional-dpi/index.js").DdpiProfile;
+    /** The sensor's current DPI as the firmware reports it, or null. */
+    sensorDpi: number | null;
+    canSave: boolean;
+  };
   /** Driver-supplied UI policy (optional; keeps control.ts brand-agnostic). */
   ui?: MouseUiHints;
   batteryPercent: number | null;

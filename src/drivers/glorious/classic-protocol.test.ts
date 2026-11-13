@@ -15,10 +15,13 @@ import {
   buildGloriousClassicRgbPayload,
   gloriousClassicDecodePollingRate,
   gloriousClassicEncodePollingRate,
+  gloriousClassicHasDdpiStamp,
   gloriousClassicRateByte,
+  gloriousClassicRelayEnvelope,
   parseGloriousClassicBatteryResponse,
   parseGloriousClassicFirmwareResponse,
 } from "../../glorious-classic/index.ts";
+import { buildDdpiRequest, ddpiCrc16 } from "../../open-directional-dpi/index.ts";
 
 // Every assertion below is written against the source's own `bfr[n]` buffer
 // index (a 65-byte buffer with bfr[0] as the report id) so it can be checked
@@ -220,4 +223,40 @@ test("battery response decodes the Series One Pro wired reply", () => {
   const reply = new Uint8Array(64);
   reply.set([0xa1, 0x00, 0x02, 0x02, 0x00, 0x83, 0x00, 0x64]);
   assert.deepEqual(parseGloriousClassicBatteryResponse(reply), { state: "Normal", percent: 100, charging: false });
+});
+
+test("receiver firmware request relays the query and asks for 16 reply bytes", () => {
+  const expected = new Uint8Array(64);
+  expected.set([0x02, 0x0a, 0x00, 0x81], 2); // bfr[3..6]: relay to the mouse, length 0x0a
+  assert.deepEqual(buildGloriousClassicFirmwareRequestPayload({ relay: true }), expected);
+});
+
+test("the Open Directional DPI stamp is read at 16..19 by cable and 12..15 through the receiver", () => {
+  const stock = new Uint8Array(64);
+  stock.set([0xa1, 0x00, 0x00, 0x03, 0x00, 0x81, 0x01, 0x00, 0x00, 0x00, 0x20, 0x18]);
+  assert.equal(gloriousClassicHasDdpiStamp(stock, false), false);
+  assert.equal(gloriousClassicHasDdpiStamp(stock, true), false);
+
+  const cable = stock.slice();
+  cable.set([0x44, 0x50, 0x30, 0x31], 16);
+  assert.equal(gloriousClassicHasDdpiStamp(cable, false), true);
+  assert.equal(gloriousClassicHasDdpiStamp(cable, true), false);
+
+  const receiver = stock.slice();
+  receiver.set([0x44, 0x50, 0x30, 0x31], 12);
+  assert.equal(gloriousClassicHasDdpiStamp(receiver, true), true);
+
+  // A stamp in a reply that is not the version answer (a 0xa0 pending status) does not count.
+  receiver[0] = 0xa0;
+  assert.equal(gloriousClassicHasDdpiStamp(receiver, true), false);
+});
+
+test("the relay envelope sets body[2..3] and keeps the CRC of the canonical packet", () => {
+  const request = buildDdpiRequest(0x02, 5);
+  const relayed = gloriousClassicRelayEnvelope(request);
+  assert.deepEqual([relayed[2], relayed[3]], [0x02, 0x3a]);
+  assert.deepEqual([request[2], request[3]], [0x01, 0x00], "the request itself is not changed");
+  assert.deepEqual(relayed.subarray(4), request.subarray(4));
+  assert.equal(relayed[62]! | (relayed[63]! << 8), ddpiCrc16(request.subarray(0, 62)));
+  assert.throws(() => gloriousClassicRelayEnvelope(request.subarray(0, 63)), /64-byte/);
 });

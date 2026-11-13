@@ -289,10 +289,14 @@ export interface GloriousClassicFirmware {
 /**
  * Firmware version request (verified on a wired Series One Pro):
  *   bfr[3]=0x00 (target), bfr[4]=0x06 (length), bfr[5]=0x00, bfr[6]=0x81.
+ * With `relay`, for the 258a:2031 receiver: bfr[3]=0x02 forwards it to the
+ * mouse and bfr[4]=0x0a copies back 16 reply bytes instead of 12, enough for the
+ * stamp at body[12..15] (see gloriousClassicHasDdpiStamp). Verified 2026-11-13.
  */
-export function buildGloriousClassicFirmwareRequestPayload(): Uint8Array<ArrayBuffer> {
+export function buildGloriousClassicFirmwareRequestPayload({ relay = false }: { relay?: boolean } = {}): Uint8Array<ArrayBuffer> {
   const body = packet();
-  bfr(body, 4, 0x06);
+  if (relay) bfr(body, 3, 0x02);
+  bfr(body, 4, relay ? 0x0a : 0x06);
   bfr(body, 6, 0x81);
   return body;
 }
@@ -319,6 +323,44 @@ export function parseGloriousClassicFirmwareResponse(body: Uint8Array): Glorious
     build,
     productId,
   };
+}
+
+// ---------------------------------------------------------------------------
+// Open Directional DPI patch (Series One Pro). A patched v1.0.0.0 build keeps
+// every stock command and adds the packets of ../open-directional-dpi/index.ts
+// to this report. A host sends them only after it has seen the patch stamp.
+// Verified on one retail mouse with the patch builds of 2026-11-13, Linux hidraw;
+// docs/glorious-series-one-pro.md section 4 says which build showed what.
+// ---------------------------------------------------------------------------
+
+/**
+ * True when a reply to buildGloriousClassicFirmwareRequestPayload() carries the
+ * patch stamp "DP01": body[16..19] by cable, body[12..15] through the receiver
+ * (only 16 bytes come back over the radio). Stock v1.0.0.0 answers with zeros
+ * there.
+ */
+export function gloriousClassicHasDdpiStamp(reply: Uint8Array, relay: boolean): boolean {
+  const at = relay ? 12 : 16;
+  return parseGloriousClassicFirmwareResponse(reply) !== null
+    && String.fromCharCode(...reply.subarray(at, at + 4)) === "DP01";
+}
+
+/**
+ * A copy of an Open Directional DPI request for the 258a:2031 receiver:
+ * body[2]=0x02 relays it to the mouse and body[3]=0x3a forwards all 64 bytes
+ * (0x3a + 6). Both are transport bytes outside the CRC, which stays the one over
+ * the canonical packet; the patch restores them before checking it. Send it only
+ * after gloriousClassicHasDdpiStamp(reply, true): builds without that stamp do
+ * not cap their reply length, and the answer would overrun the receiver's buffer.
+ */
+export function gloriousClassicRelayEnvelope(request: Uint8Array): Uint8Array<ArrayBuffer> {
+  if (request.length !== GLORIOUS_CLASSIC_PACKET_LENGTH) {
+    throw new RangeError(`The relay envelope needs a ${GLORIOUS_CLASSIC_PACKET_LENGTH}-byte request.`);
+  }
+  const copy = new Uint8Array(request);
+  copy[2] = 0x02;
+  copy[3] = 0x3a;
+  return copy;
 }
 
 /**
