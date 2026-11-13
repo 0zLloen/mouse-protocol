@@ -190,6 +190,10 @@
       "types": "./dist/glorious-classic/index.d.ts",
       "import": "./dist/glorious-classic/index.js"
     },
+    "./open-directional-dpi": {
+      "types": "./dist/open-directional-dpi/index.d.ts",
+      "import": "./dist/open-directional-dpi/index.js"
+    },
     "./glorious-sinowealth": {
       "types": "./dist/glorious-sinowealth/index.d.ts",
       "import": "./dist/glorious-sinowealth/index.js"

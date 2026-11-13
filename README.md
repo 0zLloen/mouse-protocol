@@ -66,6 +66,7 @@ checklist.
 | Motospeed | `@openmouse/protocol/motospeed` |
 | moddoMOUSE | `@openmouse/protocol/moddo` |
 | Ninjutso | `@openmouse/protocol/ninjutso` |
+| Open Directional DPI (patched Glorious Series One Pro) | `@openmouse/protocol/open-directional-dpi` |
 | Orbital | `@openmouse/protocol/orbital` |
 | RAWM | `@openmouse/protocol/rawm` |
 | Pulsar / GravaStar | `@openmouse/protocol/pulsar` |
